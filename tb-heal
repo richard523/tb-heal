@@ -29,7 +29,10 @@ While the ~1.5s exchange runs, usbhid is auto-detached from the HID interface;
 audio (a different interface) is untouched and usbhid rebinds on close.
 Concurrent invocations (tray poll + manual run, --watch + one shot) serialize
 on /tmp/tb-heal.lock: the second query waits its turn instead of losing the
-USB claim and reporting a misleading open failure.
+USB claim and reporting a misleading open failure. After every exchange the
+HID interface's driver is verified: if the kernel failed to reattach usbhid
+(which kills the dongle's physical volume/mic controls), tb-heal rebinds it
+and reports the action under "healed".
 
 Exit codes: 0 linked, 1 needs a human action on the headset, 2 no transmitter.
 
@@ -45,12 +48,13 @@ import argparse
 import ctypes
 import fcntl
 import json
+import os
 import re
 import subprocess
 import sys
 import time
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 VENDOR = 0x10F5
 DONGLE_PID = 0x2251   # USB transmitter (the dongle)
@@ -255,6 +259,64 @@ def _usb_lock(timeout=10.0):
             time.sleep(0.1)
 
 
+def _read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _hid_ifsys(pid):
+    """sysfs path of the first 10f5:<pid> device's HID interface (Linux)."""
+    if not IS_LINUX:
+        return None
+    want = "%04x" % pid
+    for ent in os.listdir("/sys/bus/usb/devices"):
+        if ":" not in ent:               # interface dirs are named dev:cfg.if
+            continue
+        p = "/sys/bus/usb/devices/" + ent
+        if _read(p + "/bInterfaceClass") != "03":
+            continue
+        if _read(p + "/../idVendor") == "10f5" \
+                and _read(p + "/../idProduct") == want:
+            return p
+    return None
+
+
+def _ensure_hid_driver(pid):
+    """usbhid should rebind to the HID interface when hidapi closes it;
+    on some kernels the reattach silently fails and the interface stays
+    driverless - the dongle's physical volume/mic controls then die.
+    Detect that and rebind (root via sudo -n when available)."""
+    p = _hid_ifsys(pid)
+    if p is None:
+        return None
+    try:
+        os.readlink(p + "/driver")
+        return None                       # healthy
+    except OSError:
+        pass
+    ifc = os.path.basename(p)
+    for cmd in (["sudo", "-n", "sh", "-c",
+                 "echo %s > /sys/bus/usb/drivers/usbhid/bind" % ifc],
+                ["sudo", "-n", "udevadm", "trigger", "--action=add", p]):
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        try:
+            os.readlink(p + "/driver")
+            return "rebound usbhid to %s (physical controls were dead)" % ifc
+        except OSError:
+            continue
+    return ("usbhid lost and not rebound (needs sudo): "
+            "sudo udevadm trigger --action=add %s" % p)
+
+
+_DRIVER_FIXES = []
+
+
 def read_gsi(pid, rx_log=None):
     """Full RACE exchange against the first 10f5:<pid> device.
 
@@ -312,6 +374,9 @@ def read_gsi(pid, rx_log=None):
     finally:
         if dev is not None:
             dev.close()
+            fix = _ensure_hid_driver(pid)
+            if fix:
+                _DRIVER_FIXES.append(fix)
         lock.close()
 
 
@@ -409,6 +474,9 @@ def check(do_heal=True):
         st["state"] = "NO_HIDAPI"
         st["error"] = str(e)
         return st
+    if _DRIVER_FIXES:
+        st["healed"].extend(_DRIVER_FIXES)
+        _DRIVER_FIXES.clear()
     gsi = parse_gsi(doc) if doc else None
     if gsi:
         st.update(link=gsi["connected"], battery=gsi["battery"],
@@ -418,7 +486,7 @@ def check(do_heal=True):
     if sink:
         st["sink"] = sink["name"]
         if do_heal:
-            st["healed"] = heal(sink)
+            st["healed"].extend(heal(sink))
         s = sink_state(sink["name"])
         st["sink_muted"], st["sink_volume"] = s["muted"], s["volume"]
         st["sink_default"] = pw_default_sink() == sink["name"]
