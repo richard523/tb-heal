@@ -1,0 +1,5 @@
+# Turtle Beach 10f5 devices (Stealth 700 Gen 3 dongle + wired headset):
+# grant raw USB access so tb-heal can query the chip (Airoha RACE status)
+# via hidapi/libusb without sudo. wheel = the user's group; uaccess also adds
+# an ACL for the active session as a fallback.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="10f5", MODE="0660", GROUP="wheel", TAG+="uaccess"

@@ -1,0 +1,535 @@
+#!/usr/bin/env python3
+"""tb-heal - Turtle Beach Stealth 700 Gen 3: one command for the whole headset path.
+
+Prints link status + battery straight from the USB transmitter (the same
+read-only exchange Swarm II performs), self-heals every PC-side edge case it
+can reach (default sink, mute, volume - Linux/PipeWire), and tells you exactly
+what to do for the headset-side edge cases no PC can fix.
+
+The model this encodes:
+  PC --> dongle (USB audio, always fine) --2.4GHz--> headset (only when powered ON)
+  The headset's USB-C port is a charger. It never carries audio, on any OS.
+  So "no audio" almost always means the headset is not linked to the dongle.
+
+Platform support:
+  Linux    status + self-heal, verified (kernel 7.2, PipeWire, hidapi libusb)
+  Windows  status query (hidapi.dll or `pip install hidapi`); heal is n/a
+  macOS    status query (brew hidapi or `pip install hidapi`); heal is n/a
+
+Link/battery query: Airoha RACE protocol over the transmitter's HID vendor
+collection. We enable the on-chip CoAP client (RACE 0x9942), send CoAP GET /GSI
+(RACE 0x9902); reply JSON keys: 220 name, 230 connected, 240 battery %,
+250 charging. Nothing on the device is written or reconfigured.
+
+Transport notes (Linux): the kernel hidraw path does NOT work for this dongle
+on kernel 7.x - its HID interface has no interrupt-OUT endpoint, hidraw writes
+are silently dropped and GET_REPORT pulls return a zeroed cache. The chip only
+answers raw control transfers, which hidapi's libusb backend issues directly.
+While the ~1.5s exchange runs, usbhid is auto-detached from the HID interface;
+audio (a different interface) is untouched and usbhid rebinds on close.
+
+Exit codes: 0 linked, 1 needs a human action on the headset, 2 no transmitter.
+
+Usage:
+  tb-heal               heal + report, one shot
+  tb-heal --wait [SECS] keep checking every 3s, notify when the link is up
+  tb-heal --watch       run forever, heal + notify on every link change
+  tb-heal --json        machine-readable one shot
+  tb-heal --no-heal     report only, touch nothing
+  tb-heal --diagnose    raw HID exchange (debug)
+"""
+import argparse
+import ctypes
+import json
+import re
+import subprocess
+import sys
+import time
+
+VERSION = "1.0.0"
+
+VENDOR = 0x10F5
+DONGLE_PID = 0x2251   # USB transmitter (the dongle)
+WIRED_PID = 0x2253    # headset itself, when plugged in via its USB-C charge cable
+OUT_RID, IN_RID, REPORT_SIZE = 0x06, 0x07, 62
+SINK_MATCH = "alsa_output.usb-Turtle_Beach"
+
+K_NAME, K_CONN, K_BATT, K_CHG = "220", "230", "240", "250"
+
+PLATFORM = sys.platform          # linux / win32 / darwin
+IS_LINUX = PLATFORM.startswith("linux")
+IS_MAC = PLATFORM == "darwin"
+
+# ctypes library candidates per platform. Linux MUST use the libusb backend:
+# the hidraw backend (libhidapi-hidraw / pip hidapi wheel) hits the kernel
+# zero-cache bug described in the module docstring.
+CTYPES_LIBS = {
+    "linux": ("libhidapi-libusb.so.0", "libhidapi-libusb.so"),
+    "darwin": ("libhidapi.dylib", "libhidapi.0.dylib"),
+    "win32": ("hidapi.dll",),
+}
+
+
+# ---------------------------------------------------------------- RACE framing
+
+def race(cmd_id, payload=b""):
+    """RACE frame: 05 5A <len16 LE> <id16 LE> <payload>; len counts the id bytes."""
+    ln = len(payload) + 2
+    return bytes([0x05, 0x5A, ln & 0xFF, (ln >> 8) & 0xFF,
+                  cmd_id & 0xFF, (cmd_id >> 8) & 0xFF]) + payload
+
+
+def coap_get(path):
+    """Minimal CoAP GET: 40 01 <msgid> <token> <Uri-Path option>."""
+    return bytes([0x40, 0x01, 0x00, 0x01]) + bytes([0xB0 | len(path)]) + path.encode()
+
+
+def parse_gsi(doc):
+    """Extract name/connected/battery/charging from a GSI reply."""
+    if not doc:
+        return None
+    kvp = doc.get("KVP", {})
+    out = {"name": kvp.get(K_NAME, "Stealth 700 Gen 3"),
+           "connected": kvp.get(K_CONN) == "1",
+           "charging": kvp.get(K_CHG) == "1"}
+    try:
+        out["battery"] = max(0, min(100, int(kvp.get(K_BATT))))
+    except (TypeError, ValueError):
+        out["battery"] = None
+    return out
+
+
+# ---------------------------------------------------------------- HID transport
+# Two interchangeable transports exposing: enumerate(vendor, pid) -> first path,
+# open(path) -> handle with get_input_report/write/close. ctypes-hidapi is the
+# primary everywhere; the `import hid` wheel is a fallback for Windows/macOS
+# (on Linux the wheel is hidraw-backed and broken for this dongle).
+
+class _HidInfo(ctypes.Structure):
+    pass
+_HidInfo._fields_ = [
+    ("path", ctypes.c_char_p), ("vendor_id", ctypes.c_ushort),
+    ("product_id", ctypes.c_ushort), ("serial_number", ctypes.c_wchar_p),
+    ("release_number", ctypes.c_ushort), ("manufacturer_string", ctypes.c_wchar_p),
+    ("product_string", ctypes.c_wchar_p), ("usage_page", ctypes.c_ushort),
+    ("usage", ctypes.c_ushort), ("interface_number", ctypes.c_int),
+    ("next", ctypes.POINTER(_HidInfo)),
+]
+
+
+class _CtypesDev:
+    def __init__(self, lib, dev):
+        self._lib, self._dev = lib, dev
+
+    def get_input_report(self, report_id, size):
+        buf = ctypes.create_string_buffer(bytes([report_id]) + b"\x00" * (size - 1), size)
+        n = self._lib.hid_get_input_report(self._dev, buf, size)
+        return buf.raw[:size] if n >= 0 else None
+
+    def write(self, data):
+        return self._lib.hid_write(self._dev, bytes(data), len(data))
+
+    def close(self):
+        self._lib.hid_close(self._dev)
+
+
+class CtypesHidapi:
+    def __init__(self):
+        last = None
+        for name in CTYPES_LIBS.get(PLATFORM, CTYPES_LIBS["linux"]):
+            try:
+                self.lib = ctypes.CDLL(name)
+                break
+            except OSError as e:
+                last = e
+        else:
+            raise RuntimeError("hidapi library not found (%s)" % last)
+        lib = self.lib
+        lib.hid_init.restype = ctypes.c_int
+        lib.hid_enumerate.restype = ctypes.POINTER(_HidInfo)
+        lib.hid_enumerate.argtypes = [ctypes.c_ushort, ctypes.c_ushort]
+        lib.hid_free_enumeration.argtypes = [ctypes.POINTER(_HidInfo)]
+        lib.hid_open_path.restype = ctypes.c_void_p
+        lib.hid_open_path.argtypes = [ctypes.c_char_p]
+        lib.hid_write.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
+        lib.hid_write.restype = ctypes.c_int
+        lib.hid_get_input_report.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+        lib.hid_get_input_report.restype = ctypes.c_int
+        lib.hid_close.argtypes = [ctypes.c_void_p]
+        lib.hid_init()
+
+    def first_path(self, vendor, pid):
+        head = self.lib.hid_enumerate(vendor, pid)
+        if not head:
+            return None
+        try:
+            return bytes(head.contents.path)     # copy before freeing the list
+        finally:
+            self.lib.hid_free_enumeration(head)
+
+    def open(self, path):
+        dev = self.lib.hid_open_path(path)
+        return _CtypesDev(self.lib, dev) if dev else None
+
+
+class _PyHidDev:
+    def __init__(self, dev):
+        self._dev = dev
+
+    def get_input_report(self, report_id, size):
+        rep = self._dev.get_input_report(report_id, size)
+        return bytes(rep[:size]) if rep else None
+
+    def write(self, data):
+        return self._dev.write(list(data))
+
+    def close(self):
+        self._dev.close()
+
+
+class PyHidapi:
+    """Fallback via the `hidapi` pip wheel (Windows/macOS)."""
+
+    def __init__(self):
+        import hid
+        self.hid = hid
+
+    def first_path(self, vendor, pid):
+        infos = self.hid.enumerate(vendor, pid)
+        return infos[0]["path"] if infos else None
+
+    def open(self, path):
+        dev = self.hid.device()
+        try:
+            dev.open_path(path)
+        except Exception:
+            return None
+        return _PyHidDev(dev)
+
+
+_transport = None
+
+
+def transport():
+    """Return the first working HID transport for this platform."""
+    global _transport
+    if _transport is not None:
+        return _transport
+    try:
+        _transport = CtypesHidapi()
+        return _transport
+    except RuntimeError:
+        pass
+    if not IS_LINUX:                       # never fall back to hidraw on Linux
+        try:
+            _transport = PyHidapi()
+            return _transport
+        except ImportError:
+            pass
+    raise RuntimeError(
+        "no usable hidapi transport. Linux: install the hidapi package "
+        "(libusb backend). Windows/macOS: `pip install hidapi` or install "
+        "the hidapi library.")
+
+
+def read_gsi(pid, rx_log=None):
+    """Full RACE exchange against the first 10f5:<pid> device.
+
+    Returns (gsi_dict_or_None, error) with error in {None, "absent", "open"}.
+    Each get_input_report pops the next chunk of the chip's response queue, so
+    the sequence is: drain stale reports, enable the CoAP client, drain again,
+    then GET /GSI and accumulate the chunked JSON reply.
+    """
+    h = transport()
+    path = h.first_path(VENDOR, pid)
+    if path is None:
+        return None, "absent"
+    dev = h.open(path)
+    if dev is None:
+        return None, "open"
+    try:
+        def pull():
+            rep = dev.get_input_report(IN_RID, REPORT_SIZE)
+            if rep is not None and rx_log is not None:
+                rx_log.append(rep)
+            return rep
+
+        def push(race_bytes):
+            buf = bytes([OUT_RID, len(race_bytes) & 0xFF, (len(race_bytes) >> 8) & 0xFF]) + race_bytes
+            dev.write(buf.ljust(REPORT_SIZE, b"\x00"))
+
+        for _ in range(5):
+            pull()
+        push(race(0x9942))                       # enable CoAP client
+        time.sleep(0.3)
+        for _ in range(5):
+            pull()
+        push(race(0x9902, coap_get("GSI")))
+        blob = bytearray()
+        for _ in range(30):
+            time.sleep(0.03)
+            rep = pull()
+            if not rep or rep[0] != IN_RID:
+                continue
+            ln = int.from_bytes(rep[1:3], "little")
+            blob += rep[3:3 + ln]
+            m = re.search(rb"\{.*\}", bytes(blob), re.S)
+            if m:
+                return json.loads(m.group().decode("utf-8", "replace")), None
+        return None, None                       # answered nothing: wedged
+    finally:
+        dev.close()
+
+
+# ---------------------------------------------------------------- PipeWire side (Linux)
+
+def pw_tb_sink():
+    """First Turtle Beach sink as {id, name}, or None."""
+    try:
+        txt = subprocess.run(["pactl", "list", "sinks", "short"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (subprocess.SubprocessError, OSError):
+        return None
+    for line in txt.splitlines():
+        f = line.split("\t")
+        if len(f) >= 2 and SINK_MATCH in f[1]:
+            return {"id": f[0], "name": f[1]}
+    return None
+
+
+def pw_default_sink():
+    try:
+        txt = subprocess.run(["pactl", "info"], capture_output=True, text=True, timeout=5).stdout
+    except (subprocess.SubprocessError, OSError):
+        return None
+    m = re.search(r"Default Sink: (\S+)", txt)
+    return m.group(1) if m else None
+
+
+def sink_state(name):
+    """Mute + volume of the named sink from `pactl list sinks`."""
+    try:
+        txt = subprocess.run(["pactl", "list", "sinks"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (subprocess.SubprocessError, OSError):
+        return {"muted": None, "volume": None}
+    block = None
+    for b in txt.split("Sink #"):
+        if ("Name: %s" % name) in b:
+            block = b
+            break
+    if block is None:
+        return {"muted": None, "volume": None}
+    mute = re.search(r"Mute: (yes|no)", block)
+    vol = re.search(r"Volume: front-left:\s*\d+ /\s*(\d+)%", block)
+    return {"muted": mute.group(1) == "yes" if mute else None,
+            "volume": int(vol.group(1)) if vol else None}
+
+
+def heal(sink):
+    """Force the PC side of the path to its intended state. Returns action list."""
+    actions = []
+    if pw_default_sink() != sink["name"]:
+        subprocess.run(["pactl", "set-default-sink", sink["id"]],
+                       capture_output=True, timeout=5)
+        actions.append("set default sink -> %s" % sink["name"])
+    st = sink_state(sink["name"])
+    if st["muted"]:
+        subprocess.run(["pactl", "set-sink-mute", sink["id"], "0"],
+                       capture_output=True, timeout=5)
+        actions.append("unmuted the sink")
+    if st["volume"] is not None and st["volume"] <= 5:
+        subprocess.run(["pactl", "set-sink-volume", sink["id"], "40%"],
+                       capture_output=True, timeout=5)
+        actions.append("volume was %d%%, raised to 40%%" % st["volume"])
+    return actions
+
+
+def notify(title, body):
+    if IS_LINUX:
+        subprocess.run(["notify-send", "-i", "audio-headset", title, body],
+                       capture_output=True, timeout=5)
+    elif IS_MAC:
+        subprocess.run(["osascript", "-e",
+                        'display notification "%s" with title "%s"' % (body, title)],
+                       capture_output=True, timeout=5)
+    # Windows: printed to stdout only.
+
+
+# ---------------------------------------------------------------- diagnosis
+
+def check(do_heal=True):
+    """One full pass: query transmitter (+ sink on Linux), heal PC side."""
+    st = {"dongle": False, "wired_usb": False,
+          "sink": None, "sink_default": False, "sink_muted": None, "sink_volume": None,
+          "link": None, "battery": None, "charging": None, "name": None,
+          "healed": [], "state": "NO_DONGLE"}
+
+    try:
+        st["dongle"] = transport().first_path(VENDOR, DONGLE_PID) is not None
+        st["wired_usb"] = transport().first_path(VENDOR, WIRED_PID) is not None
+        doc, err = read_gsi(DONGLE_PID)
+        if doc is None and err is None and st["wired_usb"]:
+            doc, err = read_gsi(WIRED_PID)     # charge cable: query the headset itself
+    except RuntimeError as e:
+        st["state"] = "NO_HIDAPI"
+        st["error"] = str(e)
+        return st
+    gsi = parse_gsi(doc) if doc else None
+    if gsi:
+        st.update(link=gsi["connected"], battery=gsi["battery"],
+                  charging=gsi["charging"], name=gsi["name"])
+
+    sink = pw_tb_sink() if IS_LINUX else None
+    if sink:
+        st["sink"] = sink["name"]
+        if do_heal:
+            st["healed"] = heal(sink)
+        s = sink_state(sink["name"])
+        st["sink_muted"], st["sink_volume"] = s["muted"], s["volume"]
+        st["sink_default"] = pw_default_sink() == sink["name"]
+
+    # state ladder: the message for each failure mode is chosen in report()
+    if not st["dongle"] and not st["wired_usb"]:
+        st["state"] = "NO_DONGLE"
+    elif not IS_LINUX:
+        st["state"] = "LINKED" if st["link"] else ("UNLINKED" if st["link"] is False else "WEDGED")
+    elif not sink:
+        st["state"] = "NO_SINK"               # dongle present, ALSA card not up yet
+    elif err == "open":
+        st["state"] = "NO_ACCESS"              # USB node not writable by this user
+    elif st["link"] is None:
+        st["state"] = "WEDGED"                 # transmitter present, not answering
+    elif st["link"]:
+        st["state"] = "LINKED"
+    else:
+        st["state"] = "UNLINKED"
+    return st
+
+
+HEADSET_STEPS = (
+    "1. unplug the USB-C charge cable, power the headset on\n"
+    "2. dongle LED should go SOLID GREEN (pulsing red = linked but mic stowed)\n"
+    "3. still nothing after ~10s: hold CROSSPLAY+MODE 10s -> auto re-pair\n"
+    "4. last resort, re-pair to the dongle: plug/unplug the dongle twice\n"
+    "   (each time: in, wait for LED, out within 2-3s), plug it in a 3rd time\n"
+    "   and leave it; then hold headset power 5-8s from OFF"
+)
+
+
+def report(st):
+    name = st["name"] or "Stealth 700X Gen 3"
+    if st["state"] == "NO_HIDAPI":
+        print("hidapi unavailable: %s" % st.get("error", ""))
+        return 2
+    if st["state"] == "NO_DONGLE":
+        print("Turtle Beach: transmitter not on USB.\n"
+              "  -> plug the dongle into a USB port; the PC side needs nothing else.")
+        return 2
+    if st["state"] == "NO_ACCESS":
+        print("Turtle Beach: cannot open the transmitter over USB (permissions).\n"
+              "  -> run the installer as root (installs the udev rule), or rerun with sudo.")
+        return 1
+    if st["state"] == "NO_SINK":
+        print("Turtle Beach: dongle present but no sound card yet (just replugged?).\n"
+              "  -> wait a few seconds and rerun tb-heal.")
+        return 1
+    if st["state"] == "WEDGED":
+        print("Turtle Beach: transmitter not answering the status query (wedged).\n"
+              "  -> unplug+replug the dongle; if it stays wedged, re-pair (see below).\n"
+              + HEADSET_STEPS)
+        return 1
+
+    batt = "%d%%" % st["battery"] if st["battery"] is not None else "?"
+    batt += " charging" if st["charging"] else ""
+    if st["state"] == "LINKED":
+        print("%s: linked. battery %s." % (name, batt))
+    else:
+        print("%s: NOT LINKED. dongle is fine, the headset is off/out of range."
+              % name)
+    if st["wired_usb"]:
+        print("  note: headset is on its USB-C cable right now - charge only,"
+              " that cable never carries audio")
+    if st["sink"]:
+        print("  sink: %s [default=%s vol=%s%% muted=%s]"
+              % (st["sink"], st["sink_default"], st["sink_volume"],
+                 st["sink_muted"]))
+    if st["healed"]:
+        print("  healed: %s" % "; ".join(st["healed"]))
+    if st["state"] == "UNLINKED":
+        print("  -> do this, in order:\n" + HEADSET_STEPS)
+        return 1
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Turtle Beach Stealth 700 Gen 3 status + self-heal",
+        epilog="Protocol reverse-engineered from Swarm II (Airoha RACE + CoAP); "
+               "read-only. Credits: PaulRichez/halobattery-stealth700.")
+    ap.add_argument("--wait", nargs="?", const=0, type=int, metavar="SECS",
+                    help="poll until linked (0/unset = forever), then notify and exit 0")
+    ap.add_argument("--watch", action="store_true",
+                    help="poll forever, notify on every link state change")
+    ap.add_argument("--interval", type=int, default=10, metavar="S",
+                    help="--watch poll interval (default 10s)")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--no-heal", action="store_true", help="report only, change nothing")
+    ap.add_argument("--diagnose", action="store_true", help="dump raw HID exchange")
+    ap.add_argument("--version", action="version", version="tb-heal %s" % VERSION)
+    args = ap.parse_args()
+    do_heal = not args.no_heal
+
+    if args.diagnose:
+        rx_log = []
+        doc, err = read_gsi(DONGLE_PID, rx_log=rx_log)
+        for rep in rx_log:
+            print("  <- " + rep.hex())
+        print("error: %s" % err)
+        print("gsi: %s" % json.dumps(doc, sort_keys=True))
+        return 0 if doc else 1
+
+    if args.json:
+        st = check(do_heal=do_heal)
+        st["ok"] = st["state"] == "LINKED"
+        print(json.dumps(st, sort_keys=True))
+        return 0 if st["ok"] else 1
+
+    if args.wait is not None:
+        deadline = time.monotonic() + args.wait if args.wait > 0 else None
+        while True:
+            st = check(do_heal=do_heal)
+            if st["state"] == "LINKED":
+                notify("Turtle Beach linked",
+                       "%s - battery %s - audio live" %
+                       (st["name"], ("%d%%" % st["battery"]) if st["battery"] is not None else "?"))
+                print("linked: %s battery %s - audio live"
+                      % (st["name"], st["battery"]))
+                return 0
+            if deadline and time.monotonic() > deadline:
+                report(st)
+                return 1
+            print("... waiting for the headset (state: %s)" % st["state"], flush=True)
+            time.sleep(3)
+
+    if args.watch:
+        prev = None
+        while True:
+            st = check(do_heal=do_heal)
+            if prev is None or st["state"] != prev:
+                if prev is not None:
+                    notify("Turtle Beach: %s" %
+                           ("linked - audio live" if st["state"] == "LINKED"
+                            else "link lost (%s)" % st["state"]),
+                           "battery %s" % (st["battery"] if st["battery"] is not None else "?"))
+                print(time.strftime("%H:%M:%S"), st["state"],
+                      "battery=%s" % st["battery"], "healed=%s" % (st["healed"] or "none"),
+                      flush=True)
+                prev = st["state"]
+            time.sleep(max(2, args.interval))
+
+    return report(check(do_heal=do_heal))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
