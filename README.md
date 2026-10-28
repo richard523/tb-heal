@@ -10,6 +10,10 @@ My Headset: linked. battery 90%.
   sink: alsa_output.usb-Turtle_Beach...analog-stereo [default=True vol=41% muted=False]
 ```
 
+Companion: [tb-tray](https://github.com/richard523/tb-tray) puts this in
+your system tray - battery percent drawn into the icon, color states,
+low-battery toast, status menu (GNOME/KDE, StatusNotifierItem).
+
 ## Why this exists
 
 The Stealth 700 Gen 3 is three devices, and the PC only ever sees the first:
