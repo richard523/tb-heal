@@ -27,6 +27,9 @@ are silently dropped and GET_REPORT pulls return a zeroed cache. The chip only
 answers raw control transfers, which hidapi's libusb backend issues directly.
 While the ~1.5s exchange runs, usbhid is auto-detached from the HID interface;
 audio (a different interface) is untouched and usbhid rebinds on close.
+Concurrent invocations (tray poll + manual run, --watch + one shot) serialize
+on /tmp/tb-heal.lock: the second query waits its turn instead of losing the
+USB claim and reporting a misleading open failure.
 
 Exit codes: 0 linked, 1 needs a human action on the headset, 2 no transmitter.
 
@@ -40,19 +43,21 @@ Usage:
 """
 import argparse
 import ctypes
+import fcntl
 import json
 import re
 import subprocess
 import sys
 import time
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 VENDOR = 0x10F5
 DONGLE_PID = 0x2251   # USB transmitter (the dongle)
 WIRED_PID = 0x2253    # headset itself, when plugged in via its USB-C charge cable
 OUT_RID, IN_RID, REPORT_SIZE = 0x06, 0x07, 62
 SINK_MATCH = "alsa_output.usb-Turtle_Beach"
+LOCK_PATH = "/tmp/tb-heal.lock"
 
 K_NAME, K_CONN, K_BATT, K_CHG = "220", "230", "240", "250"
 
@@ -232,22 +237,49 @@ def transport():
         "the hidapi library.")
 
 
+def _usb_lock(timeout=10.0):
+    """Serialize RACE exchanges. hidapi/libusb claims the HID interface,
+    so a second concurrent query (tray poll + manual run, --watch + one
+    shot) loses the claim and reports a misleading open failure. Advisory
+    file lock, cross-user. Returns the held file, or None after timeout."""
+    f = open(LOCK_PATH, "w")
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return f
+        except OSError:
+            if time.monotonic() >= deadline:
+                f.close()
+                return None
+            time.sleep(0.1)
+
+
 def read_gsi(pid, rx_log=None):
     """Full RACE exchange against the first 10f5:<pid> device.
 
-    Returns (gsi_dict_or_None, error) with error in {None, "absent", "open"}.
-    Each get_input_report pops the next chunk of the chip's response queue, so
-    the sequence is: drain stale reports, enable the CoAP client, drain again,
-    then GET /GSI and accumulate the chunked JSON reply.
+    Returns (gsi_dict_or_None, error) with error in
+    {None, "absent", "open", "busy"}. Each get_input_report pops the next
+    chunk of the chip's response queue, so the sequence is: drain stale
+    reports, enable the CoAP client, drain again, then GET /GSI and
+    accumulate the chunked JSON reply.
     """
     h = transport()
-    path = h.first_path(VENDOR, pid)
-    if path is None:
-        return None, "absent"
-    dev = h.open(path)
-    if dev is None:
-        return None, "open"
+    lock = _usb_lock()
+    if lock is None:
+        return None, "busy"
+    dev = None
     try:
+        path = h.first_path(VENDOR, pid)
+        if path is None:
+            return None, "absent"
+        dev = h.open(path)
+        if dev is None:
+            time.sleep(1.0)              # a foreign claimer may be mid-exchange
+            dev = h.open(path)
+        if dev is None:
+            return None, "open"
+
         def pull():
             rep = dev.get_input_report(IN_RID, REPORT_SIZE)
             if rep is not None and rx_log is not None:
@@ -278,7 +310,9 @@ def read_gsi(pid, rx_log=None):
                 return json.loads(m.group().decode("utf-8", "replace")), None
         return None, None                       # answered nothing: wedged
     finally:
-        dev.close()
+        if dev is not None:
+            dev.close()
+        lock.close()
 
 
 # ---------------------------------------------------------------- PipeWire side (Linux)
@@ -392,6 +426,8 @@ def check(do_heal=True):
     # state ladder: the message for each failure mode is chosen in report()
     if not st["dongle"] and not st["wired_usb"]:
         st["state"] = "NO_DONGLE"
+    elif err == "busy":
+        st["state"] = "BUSY"                   # another query holds the lock
     elif not IS_LINUX:
         st["state"] = "LINKED" if st["link"] else ("UNLINKED" if st["link"] is False else "WEDGED")
     elif not sink:
@@ -426,9 +462,16 @@ def report(st):
         print("Turtle Beach: transmitter not on USB.\n"
               "  -> plug the dongle into a USB port; the PC side needs nothing else.")
         return 2
+    if st["state"] == "BUSY":
+        print("Turtle Beach: transmitter busy - another status query is "
+              "already running.\n"
+              "  -> it will finish in a moment; nothing to fix.")
+        return 1
     if st["state"] == "NO_ACCESS":
-        print("Turtle Beach: cannot open the transmitter over USB (permissions).\n"
-              "  -> run the installer as root (installs the udev rule), or rerun with sudo.")
+        print("Turtle Beach: cannot open the transmitter over USB "
+              "(no permission, or an unrelated app holds it).\n"
+              "  -> persistent failure after a replug: run the installer "
+              "as root (udev rule), or rerun with sudo.")
         return 1
     if st["state"] == "NO_SINK":
         print("Turtle Beach: dongle present but no sound card yet (just replugged?).\n"

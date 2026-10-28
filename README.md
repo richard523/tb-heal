@@ -99,6 +99,10 @@ power the headset on -> dongle LED solid green -> hold CROSSPLAY+MODE 10s
 (hard reset, auto re-pair) -> 3x-insert transmitter pairing dance + 5-8s
 power hold.
 
+Concurrent invocations are safe: every USB exchange takes an advisory lock
+(`/tmp/tb-heal.lock`), so a tray daemon polling while you run tb-heal
+manually just waits its turn instead of colliding on the device.
+
 ## Protocol (for the curious)
 
 - The transmitter is an Airoha chip speaking the **RACE** protocol on its
